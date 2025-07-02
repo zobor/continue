@@ -6,19 +6,19 @@ fun environment(key: String) = providers.environmentVariable(key)
 
 fun Sync.prepareSandbox() {
     from("../../binary/bin") { into("${intellij.pluginName.get()}/core/") }
-    from("../vscode/node_modules/@vscode/ripgrep") { into("${intellij.pluginName.get()}/ripgrep/") }
 }
 
 val remoteRobotVersion = "0.11.23"
 
 plugins {
-    id("java") // Java support
-    alias(libs.plugins.kotlin) // Kotlin support
-    alias(libs.plugins.gradleIntelliJPlugin) // Gradle IntelliJ Plugin
-    alias(libs.plugins.changelog) // Gradle Changelog Plugin
-    alias(libs.plugins.qodana) // Gradle Qodana Plugin
-    alias(libs.plugins.kover) // Gradle Kover Plugin
+    id("java")
+    kotlin("jvm") version "1.9.0"
+    id("org.jetbrains.intellij") version "1.15.0"
+    id("org.jetbrains.changelog") version "2.1.2"
+    id("org.jetbrains.qodana") version "0.1.13"
+    id("org.jetbrains.kotlinx.kover") version "0.7.3"
     kotlin("plugin.serialization") version "1.8.0"
+    id("io.sentry.jvm.gradle") version "5.8.0"
 }
 
 group = properties("pluginGroup").get()
@@ -34,7 +34,6 @@ repositories {
 // Dependencies are managed with Gradle version catalog - read more:
 // https://docs.gradle.org/current/userguide/platforms.html#sub:version-catalog
 dependencies {
-    //    implementation(libs.annotations)
     implementation("com.squareup.okhttp3:okhttp:4.12.0") {
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
     }
@@ -43,10 +42,12 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.5.0")
     testImplementation("com.intellij.remoterobot:remote-robot:$remoteRobotVersion")
     testImplementation("com.intellij.remoterobot:remote-fixtures:$remoteRobotVersion")
+    testImplementation("io.mockk:mockk:1.14.2")
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.10.0")
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.9.2")
     testImplementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
     implementation("com.automation-remarks:video-recorder-junit5:2.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 
 
     // Exclude vulnerable Log4j from all dependencies
@@ -63,6 +64,7 @@ dependencies {
     // Add Log4j 2.x explicitly
     implementation("org.apache.logging.log4j:log4j-core:2.20.0")
     implementation("org.apache.logging.log4j:log4j-api:2.20.0")
+    testImplementation(kotlin("test"))
 }
 
 // Set the JVM language level used to build the project. Use Java 11 for 2020.3+, and Java 17 for
@@ -163,6 +165,7 @@ tasks {
         // This is to ensure we load the GUI with OSR enabled. We have logic that
         // renders with OSR disabled below a particular IDE version.
         // See ContinueExtensionSettingsService.kt for more info.
+        // Currently commented out however since test fail in CI with this version
 //        intellij {
 //            version.set("2024.1")
 //        }
@@ -189,11 +192,8 @@ tasks {
     }
 
     runIde {
-        // Open the `manual-testing-sandbox` directory and the specific file on start
-        args = listOf(
-            "${rootProject.projectDir.parentFile.parentFile}/manual-testing-sandbox",
-            "${rootProject.projectDir.parentFile.parentFile}/manual-testing-sandbox/test.kt"
-        ).map { file(it).absolutePath }
+        val dir = "${rootProject.projectDir.parentFile.parentFile.absolutePath}/manual-testing-sandbox"
+        args = listOf(dir, "$dir/test.kt")
     }
 
     test {

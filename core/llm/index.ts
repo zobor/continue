@@ -16,6 +16,8 @@ import {
   Chunk,
   CompletionOptions,
   ILLM,
+  ILLMInteractionLog,
+  ILLMLogger,
   LLMFullCompletionOptions,
   LLMOptions,
   ModelCapability,
@@ -23,6 +25,7 @@ import {
   PromptLog,
   PromptTemplate,
   RequestOptions,
+  TabAutocompleteOptions,
   TemplateType,
 } from "../index.js";
 import mergeJson from "../util/merge.js";
@@ -38,12 +41,12 @@ import {
   modelSupportsImages,
 } from "./autodetect.js";
 import {
-  CONTEXT_LENGTH_FOR_MODEL,
   DEFAULT_ARGS,
   DEFAULT_CONTEXT_LENGTH,
   DEFAULT_MAX_BATCH_SIZE,
   DEFAULT_MAX_CHUNK_SIZE,
   DEFAULT_MAX_TOKENS,
+  LLMConfigurationStatuses,
 } from "./constants.js";
 import {
   compileChatMessages,
@@ -69,8 +72,14 @@ export class LLMError extends Error {
 }
 
 export function isModelInstaller(provider: any): provider is ModelInstaller {
-  return provider && typeof provider.installModel === "function";
+  return (
+    provider &&
+    typeof provider.installModel === "function" &&
+    typeof provider.isInstallingModel === "function"
+  );
 }
+
+type InteractionStatus = "in_progress" | "success" | "error" | "cancelled";
 
 export abstract class BaseLLM implements ILLM {
   static providerName: string;
@@ -79,6 +88,16 @@ export abstract class BaseLLM implements ILLM {
   get providerName(): string {
     return (this.constructor as typeof BaseLLM).providerName;
   }
+
+  /**
+   * This exists because for the continue-proxy, sometimes we want to get the value of the underlying provider that is used on the server
+   * For example, the underlying provider should always be sent with dev data
+   */
+  get underlyingProviderName(): string {
+    return this.providerName;
+  }
+
+  autocompleteOptions?: Partial<TabAutocompleteOptions>;
 
   supportsFim(): boolean {
     return false;
@@ -121,7 +140,8 @@ export abstract class BaseLLM implements ILLM {
   model: string;
 
   title?: string;
-  systemMessage?: string;
+  baseChatSystemMessage?: string;
+  baseAgentSystemMessage?: string;
   contextLength: number;
   maxStopWords?: number | undefined;
   completionOptions: CompletionOptions;
@@ -129,7 +149,7 @@ export abstract class BaseLLM implements ILLM {
   template?: TemplateType;
   promptTemplates?: Record<string, PromptTemplate>;
   templateMessages?: (messages: ChatMessage[]) => string;
-  writeLog?: (str: string) => Promise<void>;
+  logger?: ILLMLogger;
   llmRequestHook?: (model: string, prompt: string) => any;
   apiKey?: string;
 
@@ -188,7 +208,8 @@ export abstract class BaseLLM implements ILLM {
 
     this.title = options.title;
     this.uniqueId = options.uniqueId ?? "None";
-    this.systemMessage = options.systemMessage;
+    this.baseAgentSystemMessage = options.baseAgentSystemMessage;
+    this.baseChatSystemMessage = options.baseChatSystemMessage;
     this.contextLength =
       options.contextLength ?? llmInfo?.contextLength ?? DEFAULT_CONTEXT_LENGTH;
     this.maxStopWords = options.maxStopWords ?? this.maxStopWords;
@@ -219,7 +240,7 @@ export abstract class BaseLLM implements ILLM {
         options.template,
       ) ??
       undefined;
-    this.writeLog = options.writeLog;
+    this.logger = options.logger;
     this.llmRequestHook = options.llmRequestHook;
     this.apiKey = options.apiKey;
 
@@ -257,6 +278,12 @@ export abstract class BaseLLM implements ILLM {
     this.maxEmbeddingChunkSize =
       options.maxEmbeddingChunkSize ?? DEFAULT_MAX_CHUNK_SIZE;
     this.embeddingId = `${this.constructor.name}::${this.model}::${this.maxEmbeddingChunkSize}`;
+
+    this.autocompleteOptions = options.autocompleteOptions;
+  }
+
+  getConfigurationStatus() {
+    return LLMConfigurationStatuses.VALID;
   }
 
   protected createOpenAiAdapter() {
@@ -265,6 +292,7 @@ export abstract class BaseLLM implements ILLM {
       apiKey: this.apiKey ?? "",
       apiBase: this.apiBase,
       requestOptions: this.requestOptions,
+      env: this._llmOptions.env,
     });
   }
 
@@ -272,88 +300,29 @@ export abstract class BaseLLM implements ILLM {
     return Promise.resolve([]);
   }
 
-  private _compileChatMessages(
-    options: CompletionOptions,
-    messages: ChatMessage[],
-    functions?: any[],
-  ) {
-    let contextLength = this.contextLength;
-    if (
-      options.model !== this.model &&
-      options.model in CONTEXT_LENGTH_FOR_MODEL
-    ) {
-      contextLength =
-        CONTEXT_LENGTH_FOR_MODEL[options.model] || DEFAULT_CONTEXT_LENGTH;
-    }
-
-    return compileChatMessages(
-      options.model,
-      messages,
-      contextLength,
-      options.maxTokens ?? DEFAULT_MAX_TOKENS,
-      this.supportsImages(),
-      undefined,
-      functions,
-      this.systemMessage,
-    );
-  }
-
-  private _getSystemMessage(): string | undefined {
-    // TODO: Merge with config system message
-    return this.systemMessage;
-  }
-
   private _templatePromptLikeMessages(prompt: string): string {
     if (!this.templateMessages) {
       return prompt;
     }
 
-    const msgs: ChatMessage[] = [{ role: "user", content: prompt }];
+    // NOTE system message no longer supported here
 
-    const systemMessage = this._getSystemMessage();
-    if (systemMessage) {
-      msgs.unshift({ role: "system", content: systemMessage });
-    }
+    const msgs: ChatMessage[] = [{ role: "user", content: prompt }];
 
     return this.templateMessages(msgs);
   }
 
-  private _compilePromptForLog(
-    prompt: string,
-    completionOptions: CompletionOptions,
-  ): string {
-    const completionOptionsLog = JSON.stringify(
-      {
-        contextLength: this.contextLength,
-        ...completionOptions,
-      },
-      null,
-      2,
-    );
-
-    let requestOptionsLog = "";
-    if (this.requestOptions) {
-      requestOptionsLog = JSON.stringify(this.requestOptions, null, 2);
-    }
-
-    return (
-      "##### Completion options #####\n" +
-      completionOptionsLog +
-      (requestOptionsLog
-        ? "\n\n##### Request options #####\n" + requestOptionsLog
-        : "") +
-      "\n\n##### Prompt #####\n" +
-      prompt
-    );
-  }
-
-  private _logTokensGenerated(
+  private _logEnd(
     model: string,
     prompt: string,
     completion: string,
-  ) {
+    thinking: string | undefined,
+    interaction: ILLMInteractionLog | undefined,
+    error?: any,
+  ): InteractionStatus {
     let promptTokens = this.countTokens(prompt);
     let generatedTokens = this.countTokens(completion);
+    let thinkingTokens = thinking ? this.countTokens(thinking) : 0;
 
     void Telemetry.capture(
       "tokens_generated",
@@ -377,11 +346,42 @@ export abstract class BaseLLM implements ILLM {
       name: "tokensGenerated",
       data: {
         model: model,
-        provider: this.providerName,
+        provider: this.underlyingProviderName,
         promptTokens: promptTokens,
         generatedTokens: generatedTokens,
       },
     });
+
+    if (error !== undefined) {
+      if (error === "cancel" || error.name === "AbortError") {
+        interaction?.logItem({
+          kind: "cancel",
+          promptTokens,
+          generatedTokens,
+          thinkingTokens,
+        });
+        return "cancelled";
+      } else {
+        console.log(error);
+        interaction?.logItem({
+          kind: "error",
+          name: error.name,
+          message: error.message,
+          promptTokens,
+          generatedTokens,
+          thinkingTokens,
+        });
+        return "error";
+      }
+    } else {
+      interaction?.logItem({
+        kind: "success",
+        promptTokens,
+        generatedTokens,
+        thinkingTokens,
+      });
+      return "success";
+    }
   }
 
   fetch(url: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -396,6 +396,9 @@ export abstract class BaseLLM implements ILLM {
 
         // Error mapping to be more helpful
         if (!resp.ok) {
+          if (resp.status === 499) {
+            return resp; // client side cancellation
+          }
           let text = await resp.text();
           if (resp.status === 404 && !resp.url.includes("/v1")) {
             const error = JSON.parse(text)?.error?.replace(/"/g, "'");
@@ -462,11 +465,7 @@ export abstract class BaseLLM implements ILLM {
             throw new Error(message);
           }
         }
-        //if e instance of LLMError, rethrow
-        if (e instanceof LLMError) {
-          throw e;
-        }
-        throw new Error(e.message);
+        throw e;
       }
     };
     return withExponentialBackoff<Response>(
@@ -493,26 +492,30 @@ export abstract class BaseLLM implements ILLM {
     const msgsCopy = messages ? messages.map((msg) => ({ ...msg })) : [];
     let formatted = "";
     for (const msg of msgsCopy) {
-      let contentToShow = "";
-      if (msg.role === "tool") {
-        contentToShow = msg.content;
-      } else if (msg.role === "assistant" && msg.toolCalls) {
-        contentToShow = msg.toolCalls
-          ?.map(
-            (toolCall) =>
-              `${toolCall.function?.name}(${toolCall.function?.arguments})`,
-          )
-          .join("\n");
-      } else if ("content" in msg) {
-        if (Array.isArray(msg.content)) {
-          msg.content = renderChatMessage(msg);
-        }
-        contentToShow = msg.content;
-      }
-
-      formatted += `<${msg.role}>\n${contentToShow}\n\n`;
+      formatted += this._formatChatMessage(msg);
     }
     return formatted;
+  }
+
+  private _formatChatMessage(msg: ChatMessage): string {
+    let contentToShow = "";
+    if (msg.role === "tool") {
+      contentToShow = msg.content;
+    } else if (msg.role === "assistant" && msg.toolCalls) {
+      contentToShow = msg.toolCalls
+        ?.map(
+          (toolCall) =>
+            `${toolCall.function?.name}(${toolCall.function?.arguments})`,
+        )
+        .join("\n");
+    } else if ("content" in msg) {
+      if (Array.isArray(msg.content)) {
+        msg.content = renderChatMessage(msg);
+      }
+      contentToShow = msg.content;
+    }
+
+    return `<${msg.role}>\n${contentToShow}\n\n`;
   }
 
   protected async *_streamFim(
@@ -541,50 +544,88 @@ export abstract class BaseLLM implements ILLM {
   ): AsyncGenerator<string> {
     const { completionOptions, logEnabled } =
       this._parseCompletionOptions(options);
+    const interaction = logEnabled
+      ? this.logger?.createInteractionLog()
+      : undefined;
+    let status: InteractionStatus = "in_progress";
 
     const fimLog = `Prefix: ${prefix}\nSuffix: ${suffix}`;
     if (logEnabled) {
-      if (this.writeLog) {
-        await this.writeLog(
-          this._compilePromptForLog(fimLog, completionOptions),
-        );
-      }
+      interaction?.logItem({
+        kind: "startFim",
+        prefix,
+        suffix,
+        options: completionOptions,
+      });
       if (this.llmRequestHook) {
         this.llmRequestHook(completionOptions.model, fimLog);
       }
     }
 
     let completion = "";
-
-    if (this.shouldUseOpenAIAdapter("streamFim") && this.openaiAdapter) {
-      const stream = this.openaiAdapter.fimStream(
-        toFimBody(prefix, suffix, completionOptions),
-        signal,
-      );
-      for await (const chunk of stream) {
-        const result = fromChatCompletionChunk(chunk);
-        if (result) {
-          const content = renderChatMessage(result);
-          completion += content;
-          yield content;
+    try {
+      if (this.shouldUseOpenAIAdapter("streamFim") && this.openaiAdapter) {
+        const stream = this.openaiAdapter.fimStream(
+          toFimBody(prefix, suffix, completionOptions),
+          signal,
+        );
+        for await (const chunk of stream) {
+          const result = fromChatCompletionChunk(chunk);
+          if (result) {
+            const content = renderChatMessage(result);
+            const formattedContent = this._formatChatMessage(result);
+            interaction?.logItem({
+              kind: "chunk",
+              chunk: formattedContent,
+            });
+            completion += formattedContent;
+            yield content;
+          }
+        }
+      } else {
+        for await (const chunk of this._streamFim(
+          prefix,
+          suffix,
+          signal,
+          completionOptions,
+        )) {
+          interaction?.logItem({
+            kind: "chunk",
+            chunk,
+          });
+          completion += chunk;
+          yield chunk;
         }
       }
-    } else {
-      for await (const chunk of this._streamFim(
-        prefix,
-        suffix,
-        signal,
-        completionOptions,
-      )) {
-        completion += chunk;
-        yield chunk;
+
+      status = this._logEnd(
+        completionOptions.model,
+        fimLog,
+        completion,
+        undefined,
+        interaction,
+      );
+    } catch (e) {
+      status = this._logEnd(
+        completionOptions.model,
+        fimLog,
+        completion,
+        undefined,
+        interaction,
+        e,
+      );
+      throw e;
+    } finally {
+      if (status === "in_progress") {
+        this._logEnd(
+          completionOptions.model,
+          fimLog,
+          completion,
+          undefined,
+          interaction,
+          "cancel",
+        );
       }
-    }
-
-    this._logTokensGenerated(completionOptions.model, fimLog, completion);
-
-    if (logEnabled && this.writeLog) {
-      await this.writeLog(`Completion:\n${completion}\n\n`);
     }
 
     return {
@@ -601,6 +642,10 @@ export abstract class BaseLLM implements ILLM {
   ) {
     const { completionOptions, logEnabled, raw } =
       this._parseCompletionOptions(options);
+    const interaction = logEnabled
+      ? this.logger?.createInteractionLog()
+      : undefined;
+    let status: InteractionStatus = "in_progress";
 
     let prompt = pruneRawPromptFromTop(
       completionOptions.model,
@@ -614,11 +659,11 @@ export abstract class BaseLLM implements ILLM {
     }
 
     if (logEnabled) {
-      if (this.writeLog) {
-        await this.writeLog(
-          this._compilePromptForLog(prompt, completionOptions),
-        );
-      }
+      interaction?.logItem({
+        kind: "startComplete",
+        prompt,
+        options: completionOptions,
+      });
       if (this.llmRequestHook) {
         this.llmRequestHook(completionOptions.model, prompt);
       }
@@ -646,6 +691,10 @@ export abstract class BaseLLM implements ILLM {
           )) {
             const content = chunk.choices[0]?.text ?? "";
             completion += content;
+            interaction?.logItem({
+              kind: "chunk",
+              chunk: content,
+            });
             yield content;
           }
         }
@@ -656,14 +705,40 @@ export abstract class BaseLLM implements ILLM {
           completionOptions,
         )) {
           completion += chunk;
+          interaction?.logItem({
+            kind: "chunk",
+            chunk,
+          });
           yield chunk;
         }
       }
+      status = this._logEnd(
+        completionOptions.model,
+        prompt,
+        completion,
+        undefined,
+        interaction,
+      );
+    } catch (e) {
+      status = this._logEnd(
+        completionOptions.model,
+        prompt,
+        completion,
+        undefined,
+        interaction,
+        e,
+      );
+      throw e;
     } finally {
-      this._logTokensGenerated(completionOptions.model, prompt, completion);
-
-      if (logEnabled && this.writeLog) {
-        await this.writeLog(`Completion:\n${completion}\n\n`);
+      if (status === "in_progress") {
+        this._logEnd(
+          completionOptions.model,
+          prompt,
+          completion,
+          undefined,
+          interaction,
+          "cancel",
+        );
       }
     }
 
@@ -682,6 +757,10 @@ export abstract class BaseLLM implements ILLM {
   ) {
     const { completionOptions, logEnabled, raw } =
       this._parseCompletionOptions(options);
+    const interaction = logEnabled
+      ? this.logger?.createInteractionLog()
+      : undefined;
+    let status: InteractionStatus = "in_progress";
 
     let prompt = pruneRawPromptFromTop(
       completionOptions.model,
@@ -695,34 +774,65 @@ export abstract class BaseLLM implements ILLM {
     }
 
     if (logEnabled) {
-      if (this.writeLog) {
-        await this.writeLog(
-          this._compilePromptForLog(prompt, completionOptions),
-        );
-      }
+      interaction?.logItem({
+        kind: "startComplete",
+        prompt: prompt,
+        options: completionOptions,
+      });
       if (this.llmRequestHook) {
         this.llmRequestHook(completionOptions.model, prompt);
       }
     }
 
-    let completion: string;
-    if (this.shouldUseOpenAIAdapter("complete") && this.openaiAdapter) {
-      const result = await this.openaiAdapter.completionNonStream(
-        {
-          ...toCompleteBody(prompt, completionOptions),
-          stream: false,
-        },
-        signal,
+    let completion: string = "";
+
+    try {
+      if (this.shouldUseOpenAIAdapter("complete") && this.openaiAdapter) {
+        const result = await this.openaiAdapter.completionNonStream(
+          {
+            ...toCompleteBody(prompt, completionOptions),
+            stream: false,
+          },
+          signal,
+        );
+        completion = result.choices[0].text;
+      } else {
+        completion = await this._complete(prompt, signal, completionOptions);
+      }
+
+      interaction?.logItem({
+        kind: "chunk",
+        chunk: completion,
+      });
+
+      status = this._logEnd(
+        completionOptions.model,
+        prompt,
+        completion,
+        undefined,
+        interaction,
       );
-      completion = result.choices[0].text;
-    } else {
-      completion = await this._complete(prompt, signal, completionOptions);
-    }
-
-    this._logTokensGenerated(completionOptions.model, prompt, completion);
-
-    if (logEnabled && this.writeLog) {
-      await this.writeLog(`Completion:\n${completion}\n\n`);
+    } catch (e) {
+      status = this._logEnd(
+        completionOptions.model,
+        prompt,
+        completion,
+        undefined,
+        interaction,
+        e,
+      );
+      throw e;
+    } finally {
+      if (status === "in_progress") {
+        this._logEnd(
+          completionOptions.model,
+          prompt,
+          completion,
+          undefined,
+          interaction,
+          "cancel",
+        );
+      }
     }
 
     return completion;
@@ -734,8 +844,8 @@ export abstract class BaseLLM implements ILLM {
     options: LLMFullCompletionOptions = {},
   ) {
     let completion = "";
-    for await (const chunk of this.streamChat(messages, signal, options)) {
-      completion += chunk.content;
+    for await (const message of this.streamChat(messages, signal, options)) {
+      completion += renderChatMessage(message);
     }
     return { role: "assistant" as const, content: completion };
   }
@@ -767,20 +877,31 @@ export abstract class BaseLLM implements ILLM {
   ): AsyncGenerator<ChatMessage, PromptLog> {
     let { completionOptions, logEnabled } =
       this._parseCompletionOptions(options);
+    const interaction = logEnabled
+      ? this.logger?.createInteractionLog()
+      : undefined;
+    let status: InteractionStatus = "in_progress";
 
     completionOptions = this._modifyCompletionOptions(completionOptions);
 
-    const messages = this._compileChatMessages(completionOptions, _messages);
+    const messages = compileChatMessages({
+      modelName: completionOptions.model,
+      msgs: _messages,
+      contextLength: this.contextLength,
+      maxTokens: completionOptions.maxTokens ?? DEFAULT_MAX_TOKENS,
+      supportsImages: this.supportsImages(),
+      tools: options.tools,
+    });
 
     const prompt = this.templateMessages
       ? this.templateMessages(messages)
       : this._formatChatMessages(messages);
     if (logEnabled) {
-      if (this.writeLog) {
-        await this.writeLog(
-          this._compilePromptForLog(prompt, completionOptions),
-        );
-      }
+      interaction?.logItem({
+        kind: "startChat",
+        messages,
+        options: completionOptions,
+      });
       if (this.llmRequestHook) {
         this.llmRequestHook(completionOptions.model, prompt);
       }
@@ -788,7 +909,6 @@ export abstract class BaseLLM implements ILLM {
 
     let thinking = "";
     let completion = "";
-    let citations: null | string[] = null;
 
     try {
       if (this.templateMessages) {
@@ -798,6 +918,10 @@ export abstract class BaseLLM implements ILLM {
           completionOptions,
         )) {
           completion += chunk;
+          interaction?.logItem({
+            kind: "chunk",
+            chunk: chunk,
+          });
           yield { role: "assistant", content: chunk };
         }
       } else {
@@ -813,7 +937,7 @@ export abstract class BaseLLM implements ILLM {
             );
             const msg = fromChatResponse(response);
             yield msg;
-            completion = renderChatMessage(msg);
+            completion = this._formatChatMessage(msg);
           } else {
             // Stream true
             const stream = this.openaiAdapter.chatCompletionStream(
@@ -826,15 +950,12 @@ export abstract class BaseLLM implements ILLM {
             for await (const chunk of stream) {
               const result = fromChatCompletionChunk(chunk);
               if (result) {
-                completion += result.content;
+                completion += this._formatChatMessage(result);
+                interaction?.logItem({
+                  kind: "message",
+                  message: result,
+                });
                 yield result;
-              }
-              if (
-                !citations &&
-                (chunk as any).citations &&
-                Array.isArray((chunk as any).citations)
-              ) {
-                citations = (chunk as any).citations;
               }
             }
           }
@@ -845,45 +966,57 @@ export abstract class BaseLLM implements ILLM {
             completionOptions,
           )) {
             if (chunk.role === "assistant") {
-              completion += chunk.content;
-              yield chunk;
+              completion += this._formatChatMessage(chunk);
+            } else if (chunk.role === "thinking") {
+              thinking += chunk.content;
             }
 
-            if (chunk.role === "thinking") {
-              thinking += chunk.content;
-              yield chunk;
-            }
+            interaction?.logItem({
+              kind: "message",
+              message: chunk,
+            });
+            yield chunk;
           }
         }
       }
-    } catch (error) {
-      console.log(error);
-      throw error;
-    }
-
-    this._logTokensGenerated(completionOptions.model, prompt, completion);
-
-    if (logEnabled && this.writeLog) {
-      if (thinking) {
-        await this.writeLog(`Thinking:\n${thinking}\n\n`);
-      }
-      /*
-      TODO: According to: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
-      During tool use, you must pass thinking and redacted_thinking blocks back to the API,
-      and you must include the complete unmodified block back to the API. This is critical
-      for maintaining the model's reasoning flow and conversation integrity.
-      
-      On the other hand, adding thinking and redacted_thinking blocks are ignored on subsequent
-      requests when not using tools, so it's the simplest option to always add to history.
-      */
-      await this.writeLog(`Completion:\n${completion}\n\n`);
-
-      if (citations) {
-        await this.writeLog(
-          `Citations:\n${citations.map((c, i) => `${i + 1}: ${c}`).join("\n")}\n\n`,
+      status = this._logEnd(
+        completionOptions.model,
+        prompt,
+        completion,
+        thinking,
+        interaction,
+      );
+    } catch (e) {
+      status = this._logEnd(
+        completionOptions.model,
+        prompt,
+        completion,
+        thinking,
+        interaction,
+        e,
+      );
+      throw e;
+    } finally {
+      if (status === "in_progress") {
+        this._logEnd(
+          completionOptions.model,
+          prompt,
+          completion,
+          undefined,
+          interaction,
+          "cancel",
         );
       }
     }
+    /*
+    TODO: According to: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
+    During tool use, you must pass thinking and redacted_thinking blocks back to the API,
+    and you must include the complete unmodified block back to the API. This is critical
+    for maintaining the model's reasoning flow and conversation integrity.
+
+    On the other hand, adding thinking and redacted_thinking blocks are ignored on subsequent
+    requests when not using tools, so it's the simplest option to always add to history.
+    */
 
     return {
       modelTitle: this.title ?? completionOptions.model,
@@ -941,9 +1074,17 @@ export abstract class BaseLLM implements ILLM {
         documents: chunks.map((chunk) => chunk.content),
       });
 
-      // Put them in the order they were given
-      const sortedResults = results.data.sort((a, b) => a.index - b.index);
-      return sortedResults.map((result) => result.relevance_score);
+      // Standard OpenAI format
+      if (results.data && Array.isArray(results.data)) {
+        return results.data
+          .sort((a, b) => a.index - b.index)
+          .map((result) => result.relevance_score);
+      }
+
+      throw new Error(
+        `Unexpected rerank response format from ${this.providerName}. ` +
+          `Expected 'data' array but got: ${JSON.stringify(Object.keys(results))}`,
+      );
     }
 
     throw new Error(

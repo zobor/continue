@@ -1,8 +1,38 @@
-import { ToolCallState } from "core";
+import { ContextItem, ToolCallState } from "core";
+import { safeParseToolCallArgs } from "core/tools/parseArgs";
+import { IIdeMessenger } from "../../context/IdeMessenger";
 import { RootState } from "../store";
 
 export function findCurrentToolCall(
-  state: RootState["session"]["history"],
+  chatHistory: RootState["session"]["history"],
 ): ToolCallState | undefined {
-  return state[state.length - 1]?.toolCallState;
+  return chatHistory[chatHistory.length - 1]?.toolCallState;
+}
+
+export function findToolCall(
+  chatHistory: RootState["session"]["history"],
+  toolCallId: string,
+): ToolCallState | undefined {
+  return chatHistory.find(
+    (item) => item.toolCallState?.toolCallId === toolCallId,
+  )?.toolCallState;
+}
+
+export function logToolUsage(
+  toolCallState: ToolCallState,
+  success: boolean,
+  messenger: IIdeMessenger,
+  finalOutput?: ContextItem[],
+) {
+  messenger.post("devdata/log", {
+    name: "toolUsage",
+    data: {
+      toolCallId: toolCallState.toolCallId,
+      functionName: toolCallState.toolCall?.function?.name,
+      functionArgs: toolCallState.toolCall?.function?.arguments,
+      toolCallArgs: safeParseToolCallArgs(toolCallState.toolCall),
+      output: finalOutput || toolCallState.output || [],
+      succeeded: success,
+    },
+  });
 }

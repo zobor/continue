@@ -1,8 +1,5 @@
-import { ControlPlaneSessionInfo } from "../control-plane/client";
-
 import type {
   ContinueRcJson,
-  DiffLine,
   FileStatsMap,
   FileType,
   IDE,
@@ -16,6 +13,7 @@ import type {
   TerminalOptions,
   Thread,
 } from "../";
+import { ControlPlaneSessionInfo } from "../control-plane/AuthTypes";
 
 export interface GetGhTokenArgs {
   force?: boolean;
@@ -30,20 +28,12 @@ export type ToIdeFromWebviewOrCoreProtocol = {
   openFile: [{ path: string }, void];
   openUrl: [string, void];
   runCommand: [{ command: string; options?: TerminalOptions }, void];
-  getSearchResults: [{ query: string }, string];
+  getSearchResults: [{ query: string; maxResults?: number }, string];
+  getFileResults: [{ pattern: string; maxResults?: number }, string[]];
   subprocess: [{ command: string; cwd?: string }, [string, string]];
   saveFile: [{ filepath: string }, void];
   fileExists: [{ filepath: string }, boolean];
   readFile: [{ filepath: string }, string];
-  diffLine: [
-    {
-      diffLine: DiffLine;
-      filepath: string;
-      startLine: number;
-      endLine: number;
-    },
-    void,
-  ];
   getProblems: [{ filepath: string }, Problem[]];
   getOpenFiles: [undefined, string[]];
   getCurrentFile: [
@@ -70,6 +60,7 @@ export type ToIdeFromWebviewOrCoreProtocol = {
   ];
   getAvailableThreads: [undefined, Thread[]];
   isTelemetryEnabled: [undefined, boolean];
+  isWorkspaceRemote: [undefined, boolean];
   getUniqueId: [undefined, string];
   getTags: [string, IndexTag[]];
   readSecrets: [{ keys: string[] }, Record<string, string>];
@@ -92,19 +83,15 @@ export type ToIdeFromWebviewOrCoreProtocol = {
 
   gotoDefinition: [{ location: Location }, RangeInFile[]];
 
-  getGitHubAuthToken: [GetGhTokenArgs, string | undefined];
   getControlPlaneSessionInfo: [
     { silent: boolean; useOnboarding: boolean },
     ControlPlaneSessionInfo | undefined,
   ];
   logoutOfControlPlane: [undefined, void];
+  reportError: [any, void];
+  closeSidebar: [undefined, void];
 };
 
 export type ToWebviewOrCoreFromIdeProtocol = {
   didChangeActiveTextEditor: [{ filepath: string }, void];
-  didChangeControlPlaneSessionInfo: [
-    { sessionInfo: ControlPlaneSessionInfo | undefined },
-    void,
-  ];
-  didChangeIdeSettings: [{ settings: IdeSettings }, void];
 };

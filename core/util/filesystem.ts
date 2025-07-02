@@ -17,7 +17,6 @@ import {
   Thread,
   ToastType,
 } from "../index.js";
-import { GetGhTokenArgs } from "../protocol/ide.js";
 
 class FileSystemIde implements IDE {
   constructor(private readonly workspaceDir: string) {}
@@ -35,6 +34,7 @@ class FileSystemIde implements IDE {
   ): Promise<void> {
     return Promise.resolve();
   }
+
   fileExists(fileUri: string): Promise<boolean> {
     const filepath = fileURLToPath(fileUri);
     return Promise.resolve(fs.existsSync(filepath));
@@ -43,8 +43,13 @@ class FileSystemIde implements IDE {
   gotoDefinition(location: Location): Promise<RangeInFile[]> {
     return Promise.resolve([]);
   }
+
   onDidChangeActiveTextEditor(callback: (fileUri: string) => void): void {
     return;
+  }
+
+  isWorkspaceRemote(): Promise<boolean> {
+    return Promise.resolve(false);
   }
 
   async getIdeSettings(): Promise<IdeSettings> {
@@ -52,14 +57,11 @@ class FileSystemIde implements IDE {
       remoteConfigServerUrl: undefined,
       remoteConfigSyncPeriod: 60,
       userToken: "",
-      enableControlServerBeta: false,
       continueTestEnvironment: "none",
       pauseCodebaseIndexOnStart: false,
     };
   }
-  async getGitHubAuthToken(args: GetGhTokenArgs): Promise<string | undefined> {
-    return undefined;
-  }
+
   async getFileStats(fileUris: string[]): Promise<FileStatsMap> {
     const result: FileStatsMap = {};
     for (const uri of fileUris) {
@@ -76,9 +78,11 @@ class FileSystemIde implements IDE {
     }
     return result;
   }
+
   getGitRootPath(dir: string): Promise<string | undefined> {
     return Promise.resolve(dir);
   }
+
   async listDir(dir: string): Promise<[string, FileType][]> {
     const filepath = fileURLToPath(dir);
     const all: [string, FileType][] = fs
@@ -234,8 +238,15 @@ class FileSystemIde implements IDE {
     return Promise.resolve([]);
   }
 
-  async getSearchResults(query: string): Promise<string> {
+  async getSearchResults(query: string, maxResults?: number): Promise<string> {
     return "";
+  }
+
+  async getFileResults(
+    pattern: string,
+    maxResults?: number,
+  ): Promise<string[]> {
+    return [];
   }
 
   async getProblems(fileUri?: string | undefined): Promise<Problem[]> {

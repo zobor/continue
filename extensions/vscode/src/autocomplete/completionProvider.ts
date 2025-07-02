@@ -5,14 +5,18 @@ import {
   type AutocompleteOutcome,
 } from "core/autocomplete/util/types";
 import { ConfigHandler } from "core/config/ConfigHandler";
-import { startLocalOllama } from "core/util/ollamaHelper";
+// import { IS_NEXT_EDIT_ACTIVE } from "core/nextEdit/constants";
+// import { NextEditProvider } from "core/nextEdit/NextEditProvider";
 import * as URI from "uri-js";
 import { v4 as uuidv4 } from "uuid";
 import * as vscode from "vscode";
 
-import { showFreeTrialLoginMessage } from "../util/messages";
+import { handleLLMError } from "../util/errorHandling";
+import { VsCodeIde } from "../VsCodeIde";
 import { VsCodeWebviewProtocol } from "../webviewProtocol";
 
+import { NextEditProvider } from "core/nextEdit/NextEditProvider";
+import { NextEditWindowManager } from "../activation/NextEditWindowManager";
 import { getDefinitionsFromLsp } from "./lsp";
 import { RecentlyEditedTracker } from "./recentlyEdited";
 import { RecentlyVisitedRangesService } from "./RecentlyVisitedRangesService";
@@ -23,9 +27,6 @@ import {
   stopStatusBarLoading,
 } from "./statusBar";
 
-import type { IDE } from "core";
-import { handleLLMError } from "../util/errorHandling";
-
 interface VsCodeCompletionInput {
   document: vscode.TextDocument;
   position: vscode.Position;
@@ -33,21 +34,15 @@ interface VsCodeCompletionInput {
 }
 
 export class ContinueCompletionProvider
-  implements vscode.InlineCompletionItemProvider {
-  private onError(e: any) {
-    if (handleLLMError(e)) {
+  implements vscode.InlineCompletionItemProvider
+{
+  private async onError(e: unknown) {
+    if (await handleLLMError(e)) {
       return;
     }
-    let message = e.message;
-    if (message.includes("Please sign in with GitHub")) {
-      showFreeTrialLoginMessage(
-        message,
-        this.configHandler.reloadConfig.bind(this.configHandler),
-        () => {
-          void this.webviewProtocol.request("openOnboardingCard", undefined);
-        },
-      );
-      return;
+    let message = "Continue Autocomplete Error";
+    if (e instanceof Error) {
+      message += `: ${e.message}`;
     }
     vscode.window.showErrorMessage(message, "Documentation").then((val) => {
       if (val === "Documentation") {
@@ -61,14 +56,27 @@ export class ContinueCompletionProvider
   }
 
   private completionProvider: CompletionProvider;
-  private recentlyVisitedRanges: RecentlyVisitedRangesService;
-  private recentlyEditedTracker = new RecentlyEditedTracker();
+  private nextEditProvider: NextEditProvider;
+  public recentlyVisitedRanges: RecentlyVisitedRangesService;
+  public recentlyEditedTracker: RecentlyEditedTracker;
+
+  private isNextEditActive: boolean = false;
+
+  public activateNextEdit() {
+    this.isNextEditActive = true;
+  }
+
+  public deactivateNextEdit() {
+    this.isNextEditActive = false;
+  }
 
   constructor(
     private readonly configHandler: ConfigHandler,
-    private readonly ide: IDE,
+    private readonly ide: VsCodeIde,
     private readonly webviewProtocol: VsCodeWebviewProtocol,
   ) {
+    this.recentlyEditedTracker = new RecentlyEditedTracker(ide.ideUtils);
+
     async function getAutocompleteModel() {
       const { config } = await configHandler.loadConfig();
       if (!config) {
@@ -83,11 +91,20 @@ export class ContinueCompletionProvider
       this.onError.bind(this),
       getDefinitionsFromLsp,
     );
+
+    this.nextEditProvider = NextEditProvider.initialize(
+      this.configHandler,
+      this.ide,
+      getAutocompleteModel,
+      this.onError.bind(this),
+      getDefinitionsFromLsp,
+      "fineTuned",
+    );
+
     this.recentlyVisitedRanges = new RecentlyVisitedRangesService(ide);
   }
 
   _lastShownCompletion: AutocompleteOutcome | undefined;
-
 
   public async provideInlineCompletionItems(
     document: vscode.TextDocument,
@@ -143,6 +160,10 @@ export class ContinueCompletionProvider
         line: position.line,
         character: position.character,
       };
+      // const pos = {
+      //   line: 0,
+      //   character: 0,
+      // };
       let manuallyPassFileContents: string | undefined = undefined;
       if (document.uri.scheme === "vscode-notebook-cell") {
         const notebook = vscode.workspace.notebookDocuments.find((notebook) =>
@@ -184,6 +205,10 @@ export class ContinueCompletionProvider
       // Handle commit message input box
       let manuallyPassPrefix: string | undefined = undefined;
 
+      // handle manual autocompletion trigger
+      const wasManuallyTriggered =
+        context.triggerKind === vscode.InlineCompletionTriggerKind.Invoke;
+
       const input: AutocompleteInput = {
         pos,
         manuallyPassFileContents,
@@ -199,11 +224,17 @@ export class ContinueCompletionProvider
       };
 
       setupStatusBar(undefined, true);
-      const outcome =
-        await this.completionProvider.provideInlineCompletionItems(
-          input,
-          signal,
-        );
+
+      const outcome = this.isNextEditActive
+        ? await this.nextEditProvider.provideInlineCompletionItems(
+            input,
+            signal,
+          )
+        : await this.completionProvider.provideInlineCompletionItems(
+            input,
+            signal,
+            wasManuallyTriggered,
+          );
 
       if (!outcome || !outcome.completion) {
         return null;
@@ -241,7 +272,10 @@ export class ContinueCompletionProvider
 
       // Construct the range/text to show
       const startPos = selectedCompletionInfo?.range.start ?? position;
+      // const startPos = new vscode.Position(0, 0);
+      // const endPos = new vscode.Position(0, 5);
       let range = new vscode.Range(startPos, startPos);
+      // let range = new vscode.Range(startPos, endPos);
       let completionText = outcome.completion;
       const isSingleLineCompletion = outcome.completion.split("\n").length <= 1;
 
@@ -254,7 +288,7 @@ export class ContinueCompletionProvider
         const result = processSingleLineCompletion(
           lastLineOfCompletionText,
           currentText,
-          startPos.character
+          startPos.character,
         );
 
         if (result === undefined) {
@@ -265,18 +299,23 @@ export class ContinueCompletionProvider
         if (result.range) {
           range = new vscode.Range(
             new vscode.Position(startPos.line, result.range.start),
-            new vscode.Position(startPos.line, result.range.end)
+            new vscode.Position(startPos.line, result.range.end),
           );
         }
-
+        // console.log("range", range.start, range.end);
       } else {
         // Extend the range to the end of the line for multiline completions
         range = new vscode.Range(startPos, document.lineAt(startPos).range.end);
+        // console.log("range", range.start, range.end);
       }
 
       const completionItem = new vscode.InlineCompletionItem(
         completionText,
         range,
+        // new vscode.Range(
+        //   new vscode.Position(36, 3),
+        //   new vscode.Position(36, 3),
+        // ),
         {
           title: "Log Autocomplete Outcome",
           command: "continue.logAutocompleteOutcome",
@@ -285,7 +324,20 @@ export class ContinueCompletionProvider
       );
 
       (completionItem as any).completeBracketPairs = true;
-      return [completionItem];
+
+      if (this.isNextEditActive) {
+        const editor = vscode.window.activeTextEditor;
+        if (editor && NextEditWindowManager.isInstantiated()) {
+          await NextEditWindowManager.getInstance().showNextEditWindow(
+            editor,
+            completionText,
+          );
+        }
+
+        return undefined;
+      } else {
+        return [completionItem];
+      }
     } finally {
       stopStatusBarLoading();
     }

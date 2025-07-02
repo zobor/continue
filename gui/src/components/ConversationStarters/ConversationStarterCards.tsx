@@ -1,15 +1,18 @@
-import { SlashCommandDescription } from "core";
+import { SlashCommandDescWithSource } from "core";
 import { useState } from "react";
 import { useBookmarkedSlashCommands } from "../../hooks/useBookmarkedSlashCommands";
 import { useAppDispatch, useAppSelector } from "../../redux/hooks";
-import { setMainEditorContentTrigger } from "../../redux/slices/sessionSlice";
-import { getParagraphNodeFromString } from "../mainInput/utils";
+import { useMainEditor } from "../mainInput/TipTapEditor";
 import { ConversationStarterCard } from "./ConversationStarterCard";
 
 const NUM_CARDS_TO_RENDER = 5;
 
+/**
+ * Displays a grid of conversation starter cards for bookmarked slash commands
+ */
 export function ConversationStarterCards() {
   const dispatch = useAppDispatch();
+  const { mainEditor } = useMainEditor();
   const [showAll, setShowAll] = useState(false);
   const { isCommandBookmarked } = useBookmarkedSlashCommands();
   const slashCommands = useAppSelector(
@@ -20,12 +23,12 @@ export function ConversationStarterCards() {
     isCommandBookmarked(command.name),
   );
 
-  function onClick(command: SlashCommandDescription) {
-    if (command.prompt) {
-      dispatch(
-        setMainEditorContentTrigger(getParagraphNodeFromString(command.prompt)),
-      );
-    }
+  function onClick(command: SlashCommandDescWithSource) {
+    mainEditor?.commands.insertPrompt({
+      description: command.description,
+      title: command.name,
+      content: command.prompt,
+    });
   }
 
   if (bookmarkedSlashCommands.length === 0) {

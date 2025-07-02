@@ -1,6 +1,11 @@
+import { MessageModes, ModelDescription } from "core";
 import { ProfileDescription } from "core/config/ProfileLifecycleManager";
+import {
+  DEFAULT_AGENT_SYSTEM_MESSAGE,
+  DEFAULT_CHAT_SYSTEM_MESSAGE,
+} from "core/llm/constructMessages";
 import _ from "lodash";
-import { KeyboardEvent } from "react";
+import { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { getLocalStorage } from "./localStorage";
 
 export type Platform = "mac" | "linux" | "windows" | "unknown";
@@ -21,7 +26,7 @@ export function getPlatform(): Platform {
 export function isMetaEquivalentKeyPressed({
   metaKey,
   ctrlKey,
-}: KeyboardEvent): boolean {
+}: KeyboardEvent | ReactKeyboardEvent): boolean {
   const platform = getPlatform();
   switch (platform) {
     case "mac":
@@ -113,4 +118,22 @@ export function updatedObj(old: any, pathToValue: { [key: string]: any }) {
 
 export function isLocalProfile(profile: ProfileDescription): boolean {
   return profile.profileType === "local";
+}
+
+/**
+ * Get the base system message for the agent or chat mode from the model description.
+ */
+export function getBaseSystemMessage(
+  modelDetails: ModelDescription | null,
+  mode: MessageModes,
+) {
+  let baseChatOrAgentSystemMessage: string | undefined;
+  if (mode === "agent") {
+    baseChatOrAgentSystemMessage =
+      modelDetails?.baseAgentSystemMessage ?? DEFAULT_AGENT_SYSTEM_MESSAGE;
+  } else {
+    baseChatOrAgentSystemMessage =
+      modelDetails?.baseChatSystemMessage ?? DEFAULT_CHAT_SYSTEM_MESSAGE;
+  }
+  return baseChatOrAgentSystemMessage;
 }

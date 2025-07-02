@@ -21,6 +21,7 @@ import {
   StatusBarStatus,
 } from "../autocomplete/statusBar";
 import { registerAllCommands } from "../commands";
+import { ContinueConsoleWebviewViewProvider } from "../ContinueConsoleWebviewViewProvider";
 import { ContinueGUIWebviewViewProvider } from "../ContinueGUIWebviewViewProvider";
 import { VerticalDiffManager } from "../diff/vertical/manager";
 import { registerAllCodeLensProviders } from "../lang-server/codeLens";
@@ -35,11 +36,17 @@ import {
 } from "../stubs/WorkOsAuthProvider";
 import { Battery } from "../util/battery";
 import { FileSearch } from "../util/FileSearch";
+import { VsCodeIdeUtils } from "../util/ideUtils";
 import { VsCodeIde } from "../VsCodeIde";
 
 import { ConfigYamlDocumentLinkProvider } from "./ConfigYamlDocumentLinkProvider";
 import { VsCodeMessenger } from "./VsCodeMessenger";
 
+import setupNextEditWindowManager, {
+  NextEditWindowManager,
+} from "../activation/NextEditWindowManager";
+import { getDefinitionsFromLsp } from "../autocomplete/lsp";
+import { handleTextDocumentChange } from "../util/editLoggingUtils";
 import type { VsCodeWebviewProtocol } from "../webviewProtocol";
 
 export class VsCodeExtension {
@@ -48,6 +55,8 @@ export class VsCodeExtension {
   private configHandler: ConfigHandler;
   private extensionContext: vscode.ExtensionContext;
   private ide: VsCodeIde;
+  private ideUtils: VsCodeIdeUtils;
+  private consoleView: ContinueConsoleWebviewViewProvider;
   private sidebar: ContinueGUIWebviewViewProvider;
   private windowId: string;
   private editDecorationManager: EditDecorationManager;
@@ -58,11 +67,12 @@ export class VsCodeExtension {
   private workOsAuthProvider: WorkOsAuthProvider;
   private fileSearch: FileSearch;
   private uriHandler = new UriEventHandler();
+  private completionProvider: ContinueCompletionProvider;
 
   constructor(context: vscode.ExtensionContext) {
     // Register auth provider
     this.workOsAuthProvider = new WorkOsAuthProvider(context, this.uriHandler);
-    this.workOsAuthProvider.refreshSessions();
+    void this.workOsAuthProvider.refreshSessions();
     context.subscriptions.push(this.workOsAuthProvider);
 
     this.editDecorationManager = new EditDecorationManager(context);
@@ -74,6 +84,7 @@ export class VsCodeExtension {
       },
     );
     this.ide = new VsCodeIde(this.webviewProtocolPromise, context);
+    this.ideUtils = new VsCodeIdeUtils();
     this.extensionContext = context;
     this.windowId = uuidv4();
 
@@ -106,10 +117,6 @@ export class VsCodeExtension {
     );
     resolveWebviewProtocol(this.sidebar.webviewProtocol);
 
-    // Config Handler with output channel
-    const outputChannel = vscode.window.createOutputChannel(
-      "Continue - LLM Prompt/Completion",
-    );
     const inProcessMessenger = new InProcessMessenger<
       ToCoreProtocol,
       FromCoreProtocol
@@ -123,33 +130,28 @@ export class VsCodeExtension {
       configHandlerPromise,
       this.workOsAuthProvider,
       this.editDecorationManager,
+      context,
+      this,
     );
 
-    this.core = new Core(inProcessMessenger, this.ide, async (log: string) => {
-      outputChannel.appendLine(
-        "==========================================================================",
-      );
-      outputChannel.appendLine(
-        "==========================================================================",
-      );
-      outputChannel.append(log);
-    });
+    this.core = new Core(inProcessMessenger, this.ide);
     this.configHandler = this.core.configHandler;
     resolveConfigHandler?.(this.configHandler);
 
-    this.configHandler.loadConfig();
+    void this.configHandler.loadConfig();
+
     this.verticalDiffManager = new VerticalDiffManager(
-      this.configHandler,
       this.sidebar.webviewProtocol,
       this.editDecorationManager,
+      this.ide,
     );
     resolveVerticalDiffManager?.(this.verticalDiffManager);
 
-    setupRemoteConfigSync(
+    void setupRemoteConfigSync(
       this.configHandler.reloadConfig.bind(this.configHandler),
     );
 
-    this.configHandler.loadConfig().then(({ config }) => {
+    void this.configHandler.loadConfig().then(({ config }) => {
       const { verticalDiffCodeLens } = registerAllCodeLensProviders(
         context,
         this.verticalDiffManager.fileUriToCodeLens,
@@ -162,6 +164,18 @@ export class VsCodeExtension {
 
     this.configHandler.onConfigUpdate(
       async ({ config: newConfig, configLoadInterrupted }) => {
+        if (newConfig?.experimental?.optInNextEditFeature) {
+          // Set up next edit window manager only for Continue team members
+          await setupNextEditWindowManager(context);
+
+          this.activateNextEdit();
+          await NextEditWindowManager.freeTabAndEsc();
+        } else {
+          NextEditWindowManager.clearInstance();
+          this.deactivateNextEdit();
+          await NextEditWindowManager.freeTabAndEsc();
+        }
+
         if (configLoadInterrupted) {
           // Show error in status bar
           setupStatusBar(undefined, undefined, true);
@@ -185,14 +199,15 @@ export class VsCodeExtension {
     setupStatusBar(
       enabled ? StatusBarStatus.Enabled : StatusBarStatus.Disabled,
     );
+    this.completionProvider = new ContinueCompletionProvider(
+      this.configHandler,
+      this.ide,
+      this.sidebar.webviewProtocol,
+    );
     context.subscriptions.push(
       vscode.languages.registerInlineCompletionItemProvider(
         [{ pattern: "**" }],
-        new ContinueCompletionProvider(
-          this.configHandler,
-          this.ide,
-          this.sidebar.webviewProtocol,
-        ),
+        this.completionProvider,
       ),
     );
 
@@ -202,33 +217,11 @@ export class VsCodeExtension {
       let profileId = queryParams.get("profile_id");
       let orgId = queryParams.get("org_id");
 
-      if (orgId) {
-        if (orgId === "null") {
-          orgId = null;
-        }
-        // In case org id is passed with profile id
-        // Make sure org is updated before profile is set
-        if (profileId) {
-          if (profileId === "null") {
-            profileId = null;
-          }
-          this.core.invoke("didChangeSelectedOrg", {
-            id: orgId,
-            profileId,
-          });
-        } else {
-          this.core.invoke("didChangeSelectedOrg", {
-            id: orgId,
-          });
-        }
-      } else if (profileId) {
-        if (profileId === "null") {
-          profileId = null;
-        }
-        this.core.invoke("didChangeSelectedProfile", {
-          id: profileId,
-        });
-      }
+      this.core.invoke("config/refreshProfiles", {
+        selectOrgId: orgId === "null" ? undefined : (orgId ?? undefined),
+        selectProfileId:
+          profileId === "null" ? undefined : (profileId ?? undefined),
+      });
     });
 
     // Battery
@@ -253,15 +246,29 @@ export class VsCodeExtension {
       this.fileSearch,
     );
 
+    // LLM Log view
+    this.consoleView = new ContinueConsoleWebviewViewProvider(
+      this.windowId,
+      this.extensionContext,
+      this.core.llmLogger,
+    );
+
+    context.subscriptions.push(
+      vscode.window.registerWebviewViewProvider(
+        "continue.continueConsoleView",
+        this.consoleView,
+      ),
+    );
+
     // Commands
     registerAllCommands(
       context,
       this.ide,
       context,
       this.sidebar,
+      this.consoleView,
       this.configHandler,
       this.verticalDiffManager,
-      this.core.continueServerClientPromise,
       this.battery,
       quickEdit,
       this.core,
@@ -295,11 +302,22 @@ export class VsCodeExtension {
       if (stats.size === 0) {
         return;
       }
-      this.configHandler.reloadConfig();
+      void this.configHandler.reloadConfig();
+    });
+
+    vscode.workspace.onDidChangeTextDocument(async (event) => {
+      const editInfo = await handleTextDocumentChange(
+        event,
+        this.configHandler,
+        this.ide,
+        this.completionProvider,
+        getDefinitionsFromLsp,
+      );
+
+      if (editInfo) this.core.invoke("files/smallEdit", editInfo);
     });
 
     vscode.workspace.onDidSaveTextDocument(async (event) => {
-      this.ide.updateLastFileSaveTimestamp();
       this.core.invoke("files/changed", {
         uris: [event.uri.toString()],
       });
@@ -327,26 +345,18 @@ export class VsCodeExtension {
     vscode.authentication.onDidChangeSessions(async (e) => {
       const env = await getControlPlaneEnv(this.ide.getIdeSettings());
       if (e.provider.id === env.AUTH_TYPE) {
-        vscode.commands.executeCommand(
+        void vscode.commands.executeCommand(
           "setContext",
           "continue.isSignedInToControlPlane",
           true,
         );
 
         const sessionInfo = await getControlPlaneSessionInfo(true, false);
-        this.webviewProtocolPromise.then(async (webviewProtocol) => {
-          void webviewProtocol.request("didChangeControlPlaneSessionInfo", {
-            sessionInfo,
-          });
-
-          // To make sure continue-proxy models and anything else requiring it get updated access token
-          this.configHandler.reloadConfig();
-        });
         void this.core.invoke("didChangeControlPlaneSessionInfo", {
           sessionInfo,
         });
       } else {
-        vscode.commands.executeCommand(
+        void vscode.commands.executeCommand(
           "setContext",
           "continue.isSignedInToControlPlane",
           false,
@@ -359,7 +369,7 @@ export class VsCodeExtension {
     });
 
     // Refresh index when branch is changed
-    this.ide.getWorkspaceDirs().then((dirs) =>
+    void this.ide.getWorkspaceDirs().then((dirs) =>
       dirs.forEach(async (dir) => {
         const repo = await this.ide.getRepo(dir);
         if (repo) {
@@ -409,16 +419,19 @@ export class VsCodeExtension {
     context.subscriptions.push(linkProvider);
 
     this.ide.onDidChangeActiveTextEditor((filepath) => {
-      void this.core.invoke("didChangeActiveTextEditor", { filepath });
+      void this.core.invoke("files/opened", { uris: [filepath] });
     });
+
+    // initializes openedFileLruCache with files that are already open when the extension is activated
+    let initialOpenedFilePaths = this.ideUtils
+      .getOpenFiles()
+      .map((uri) => uri.toString());
+    this.core.invoke("files/opened", { uris: initialOpenedFilePaths });
 
     vscode.workspace.onDidChangeConfiguration(async (event) => {
       if (event.affectsConfiguration(EXTENSION_NAME)) {
         const settings = await this.ide.getIdeSettings();
-        const webviewProtocol = await this.webviewProtocolPromise;
-        void webviewProtocol.request("didChangeIdeSettings", {
-          settings,
-        });
+        void this.core.invoke("config/ideSettingsUpdate", settings);
       }
     });
   }
@@ -430,5 +443,13 @@ export class VsCodeExtension {
 
   registerCustomContextProvider(contextProvider: IContextProvider) {
     this.configHandler.registerCustomContextProvider(contextProvider);
+  }
+
+  public activateNextEdit() {
+    this.completionProvider.activateNextEdit();
+  }
+
+  public deactivateNextEdit() {
+    this.completionProvider.deactivateNextEdit();
   }
 }
